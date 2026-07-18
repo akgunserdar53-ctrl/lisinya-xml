@@ -33,7 +33,7 @@ jobs:
           curl --fail --location --retry 4 --retry-delay 10 \
             "https://www.lisinya.com/storage/cache/feed/0-lisinyakitap.xml" \
             --output kaynak.xml
-          sed 's/-k0707<\/barkod>/<\/barkod>/g' kaynak.xml \
+          sed 's/-k0707//g' kaynak.xml \
             > public/lisinyakitap-guncel.xml
           touch public/.nojekyll
           printf '%s\n' '<!doctype html><meta charset="utf-8"><title>Lisinya XML</title><p>XML akisi hazir.</p>' \
