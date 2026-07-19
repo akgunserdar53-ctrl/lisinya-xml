@@ -25,7 +25,7 @@ jobs:
       - name: Depoyu al
         uses: actions/checkout@v4
 
-      - name: XML indir ve barkodlari temizle
+      - name: XML indir ve yasakli ifadeleri temizle
         shell: bash
         run: |
           set -euo pipefail
@@ -33,10 +33,45 @@ jobs:
           curl --fail --location --retry 4 --retry-delay 10 \
             "https://www.lisinya.com/storage/cache/feed/0-lisinyakitap.xml" \
             --output kaynak.xml
-          sed 's/-k0707//g' kaynak.xml \
-            > public/lisinyakitap-guncel.xml
+
+          python3 - <<'PY'
+          import re
+
+          source = "kaynak.xml"
+          target = "public/lisinyakitap-guncel.xml"
+
+          with open(source, "r", encoding="utf-8") as handle:
+              content = handle.read()
+
+          forbidden = [
+              ("k0707", re.compile(r"-k0707", re.IGNORECASE)),
+              ("AV", re.compile(r"(?<!\w)AV(?!\w)", re.IGNORECASE)),
+              ("SİLAH", re.compile(r"(?<!\w)S[Iİ]LAH(?!\w)", re.IGNORECASE)),
+              ("TETİK", re.compile(r"(?<!\w)TET[Iİ]K(?!\w)", re.IGNORECASE)),
+              ("NAMLU", re.compile(r"(?<!\w)NAMLU(?!\w)", re.IGNORECASE)),
+              (
+                  "NATIONAL GEOGRAPHIC",
+                  re.compile(
+                      r"(?<!\w)NATIONAL\s+GEOGRAPHIC(?!\w)",
+                      re.IGNORECASE,
+                  ),
+              ),
+          ]
+
+          counts = {}
+          for name, pattern in forbidden:
+              content, count = pattern.subn("", content)
+              counts[name] = count
+
+          with open(target, "w", encoding="utf-8") as handle:
+              handle.write(content)
+
+          print("Temizlenen ifadeler:", counts)
+          PY
+
           touch public/.nojekyll
-          printf '%s\n' '<!doctype html><meta charset="utf-8"><title>Lisinya XML</title><p>XML akisi hazir.</p>' \
+          printf '%s\n' \
+            '<!doctype html><meta charset="utf-8"><title>Lisinya XML</title><p>XML akisi hazir.</p>' \
             > public/index.html
 
       - name: XML dogrula
@@ -44,29 +79,69 @@ jobs:
         run: |
           python3 - <<'PY'
           import os
+          import re
           import xml.etree.ElementTree as ET
 
           path = "public/lisinyakitap-guncel.xml"
-          products = barcodes = suffixes = 0
+          products = 0
+          barcodes = 0
+          suffixes = 0
+
           for _, element in ET.iterparse(path, events=("end",)):
               if element.tag == "product":
                   products += 1
               elif element.tag == "barkod":
                   barcodes += 1
-                  if (element.text or "").endswith("-k0707"):
+                  if (element.text or "").lower().endswith("-k0707"):
                       suffixes += 1
               element.clear()
 
+          with open(path, "r", encoding="utf-8") as handle:
+              content = handle.read()
+
+          forbidden = [
+              re.compile(r"-k0707", re.IGNORECASE),
+              re.compile(r"(?<!\w)AV(?!\w)", re.IGNORECASE),
+              re.compile(r"(?<!\w)S[Iİ]LAH(?!\w)", re.IGNORECASE),
+              re.compile(r"(?<!\w)TET[Iİ]K(?!\w)", re.IGNORECASE),
+              re.compile(r"(?<!\w)NAMLU(?!\w)", re.IGNORECASE),
+              re.compile(
+                  r"(?<!\w)NATIONAL\s+GEOGRAPHIC(?!\w)",
+                  re.IGNORECASE,
+              ),
+          ]
+
+          remaining = [
+              pattern.pattern
+              for pattern in forbidden
+              if pattern.search(content)
+          ]
+
           size = os.path.getsize(path)
+
           if products < 10000:
               raise SystemExit(f"Beklenmeyen urun sayisi: {products}")
           if barcodes != products:
-              raise SystemExit(f"Urun/barkod sayisi uyusmuyor: {products}/{barcodes}")
+              raise SystemExit(
+                  f"Urun/barkod sayisi uyusmuyor: {products}/{barcodes}"
+              )
           if suffixes:
-              raise SystemExit(f"Temizlenmemis barkod sayisi: {suffixes}")
+              raise SystemExit(
+                  f"Temizlenmemis barkod sayisi: {suffixes}"
+              )
+          if remaining:
+              raise SystemExit(
+                  f"Temizlenmemis yasakli ifadeler: {remaining}"
+              )
           if size < 10_000_000:
-              raise SystemExit(f"XML beklenenden kucuk: {size} bayt")
-          print(f"Dogrulandi: {products} urun, {barcodes} temiz barkod, {size} bayt")
+              raise SystemExit(
+                  f"XML beklenenden kucuk: {size} bayt"
+              )
+
+          print(
+              f"Dogrulandi: {products} urun, "
+              f"{barcodes} temiz barkod, {size} bayt"
+          )
           PY
 
       - name: Pages ayarlari
@@ -89,7 +164,8 @@ jobs:
           if [ "$old" != "$month" ]; then
             printf '%s\n' "$month" > .last-success-month
             git config user.name "github-actions[bot]"
-            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            git config user.email \
+              "41898282+github-actions[bot]@users.noreply.github.com"
             git add .last-success-month
             git commit -m "Aylik otomasyon kaydi: $month"
             git push
