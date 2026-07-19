@@ -3,7 +3,7 @@ name: Lisinya temiz XML
 on:
   workflow_dispatch:
   schedule:
-    - cron: "17 * * * *"
+    - cron: "23 * * * *"
 
 permissions:
   contents: write
@@ -36,15 +36,12 @@ jobs:
 
           python3 - <<'PY'
           import re
+          import xml.etree.ElementTree as ET
 
           source = "kaynak.xml"
           target = "public/lisinyakitap-guncel.xml"
 
-          with open(source, "r", encoding="utf-8") as handle:
-              content = handle.read()
-
           forbidden = [
-              ("k0707", re.compile(r"-k0707", re.IGNORECASE)),
               ("AV", re.compile(r"(?<!\w)AV(?!\w)", re.IGNORECASE)),
               ("SİLAH", re.compile(r"(?<!\w)S[Iİ]LAH(?!\w)", re.IGNORECASE)),
               ("TETİK", re.compile(r"(?<!\w)TET[Iİ]K(?!\w)", re.IGNORECASE)),
@@ -58,13 +55,64 @@ jobs:
               ),
           ]
 
-          counts = {}
-          for name, pattern in forbidden:
-              content, count = pattern.subn("", content)
-              counts[name] = count
+          lisinya_patterns = [
+              re.compile(
+                  r"Ürün\s+Markası\s*:\s*Lisinya(?:\s+Kitap)?",
+                  re.IGNORECASE,
+              ),
+              re.compile(r"\bTRY\s+Lisinya\s+Kitap\b", re.IGNORECASE),
+              re.compile(r"\bLisinya\s+Kitap\b", re.IGNORECASE),
+              re.compile(r"\bLisinya\b", re.IGNORECASE),
+          ]
 
-          with open(target, "w", encoding="utf-8") as handle:
-              handle.write(content)
+          text_tags = {"name", "description"}
+          code_tags = {"barkod", "model"}
+          counts = {name: 0 for name, _ in forbidden}
+          counts.update({"LISINYA": 0, "K0707": 0, "MARKA_NO_NAME": 0})
+
+          def local_name(tag):
+              return tag.rsplit("}", 1)[-1].lower()
+
+          def clean_text(value):
+              for pattern in lisinya_patterns:
+                  value, count = pattern.subn("", value)
+                  counts["LISINYA"] += count
+              for name, pattern in forbidden:
+                  value, count = pattern.subn("", value)
+                  counts[name] += count
+              value = re.sub(r"[ \t]{2,}", " ", value)
+              value = re.sub(r"\s+(<br\s*/?>)", r"\1", value, flags=re.I)
+              return value.strip(" -|:")
+
+          tree = ET.parse(source)
+          root = tree.getroot()
+
+          for element in root.iter():
+              tag = local_name(element.tag)
+              value = element.text or ""
+
+              if tag in code_tags:
+                  cleaned, count = re.subn(
+                      r"-k0707$", "", value.strip(), flags=re.IGNORECASE
+                  )
+                  element.text = cleaned
+                  counts["K0707"] += count
+              elif tag in text_tags:
+                  element.text = clean_text(value)
+              elif tag == "brand" and re.search(
+                  r"\blisinya\b", value, flags=re.IGNORECASE
+              ):
+                  cleaned = clean_text(value)
+                  element.text = cleaned or "No Name"
+                  if not cleaned:
+                      counts["MARKA_NO_NAME"] += 1
+
+          tree.write(
+              target,
+              encoding="utf-8",
+              xml_declaration=True,
+              short_empty_elements=True,
+          )
 
           print("Temizlenen ifadeler:", counts)
           PY
@@ -86,21 +134,9 @@ jobs:
           products = 0
           barcodes = 0
           suffixes = 0
-
-          for _, element in ET.iterparse(path, events=("end",)):
-              if element.tag == "product":
-                  products += 1
-              elif element.tag == "barkod":
-                  barcodes += 1
-                  if (element.text or "").lower().endswith("-k0707"):
-                      suffixes += 1
-              element.clear()
-
-          with open(path, "r", encoding="utf-8") as handle:
-              content = handle.read()
+          forbidden_hits = []
 
           forbidden = [
-              re.compile(r"-k0707", re.IGNORECASE),
               re.compile(r"(?<!\w)AV(?!\w)", re.IGNORECASE),
               re.compile(r"(?<!\w)S[Iİ]LAH(?!\w)", re.IGNORECASE),
               re.compile(r"(?<!\w)TET[Iİ]K(?!\w)", re.IGNORECASE),
@@ -109,13 +145,30 @@ jobs:
                   r"(?<!\w)NATIONAL\s+GEOGRAPHIC(?!\w)",
                   re.IGNORECASE,
               ),
+              re.compile(r"\blisinya\b", re.IGNORECASE),
           ]
 
-          remaining = [
-              pattern.pattern
-              for pattern in forbidden
-              if pattern.search(content)
-          ]
+          def local_name(tag):
+              return tag.rsplit("}", 1)[-1].lower()
+
+          for _, element in ET.iterparse(path, events=("end",)):
+              tag = local_name(element.tag)
+              value = element.text or ""
+              if tag == "product":
+                  products += 1
+              elif tag == "barkod":
+                  barcodes += 1
+                  if value.lower().endswith("-k0707"):
+                      suffixes += 1
+              elif tag == "model" and value.lower().endswith("-k0707"):
+                  suffixes += 1
+              elif tag in {"name", "description", "brand"}:
+                  for pattern in forbidden:
+                      if pattern.search(value):
+                          forbidden_hits.append(
+                              f"{tag}: {pattern.pattern}"
+                          )
+              element.clear()
 
           size = os.path.getsize(path)
 
@@ -129,9 +182,10 @@ jobs:
               raise SystemExit(
                   f"Temizlenmemis barkod sayisi: {suffixes}"
               )
-          if remaining:
+          if forbidden_hits:
               raise SystemExit(
-                  f"Temizlenmemis yasakli ifadeler: {remaining}"
+                  "Temizlenmemis metin alanlari: "
+                  f"{forbidden_hits[:20]}"
               )
           if size < 10_000_000:
               raise SystemExit(
