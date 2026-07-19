@@ -1,55 +1,57 @@
-name: Kuzgun Price Engine v1.0
+name: Kuzgun Bulk Price Engine v1.0
 
 on:
   workflow_dispatch:
     inputs:
-      barcode:
-        description: "Fiyati incelenecek tek barkod"
-        required: true
-        default: "9786051008608"
-        type: string
       mode:
-        description: "KONTROL gondermez; UYGULA tek urunun fiyatini gonderir"
+        description: "TOPLU_KONTROL raporlar; TOPLU_UYGULA guvenli fiyatlari gonderir"
         required: true
-        default: "KONTROL"
+        default: "TOPLU_KONTROL"
         type: choice
         options:
-          - KONTROL
-          - UYGULA
+          - TOPLU_KONTROL
+          - TOPLU_UYGULA
       confirmation:
-        description: "Normal uygulama: FIYATI_GUNCELLE | Fark %40'tan buyukse: RISKLI_FIYATI_ONAYLA"
+        description: "TOPLU_UYGULA icin aynen TOPLU_FIYATLARI_GUNCELLE yazin"
         required: false
         default: ""
+        type: string
+      max_products:
+        description: "0 = tum urunler; ilk denemede 100 yazabilirsiniz"
+        required: true
+        default: "100"
         type: string
 
 permissions:
   contents: read
 
 concurrency:
-  group: kuzgun-price-engine-single-product
+  group: kuzgun-bulk-price-engine
   cancel-in-progress: false
 
 jobs:
-  single-product-price-control:
+  bulk-price-control:
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 60
     env:
       XML_URL: https://akgunserdar53-ctrl.github.io/lisinya-xml/lisinyakitap-guncel.xml
-      TEST_BARCODE: ${{ inputs.barcode }}
       RUN_MODE: ${{ inputs.mode }}
       CONFIRMATION: ${{ inputs.confirmation }}
+      MAX_PRODUCTS: ${{ inputs.max_products }}
       TRENDYOL_SELLER_ID: ${{ secrets.TRENDYOL_SELLER_ID }}
       TRENDYOL_API_KEY: ${{ secrets.TRENDYOL_API_KEY }}
       TRENDYOL_API_SECRET: ${{ secrets.TRENDYOL_API_SECRET }}
       TRENDYOL_STOREFRONT_CODE: TR
 
     steps:
-      - name: Kuzgun fiyat motorunu calistir
+      - name: Kuzgun toplu fiyat motorunu calistir
         shell: bash
         run: |
           set -euo pipefail
+
           python3 - <<'PY'
           import base64
+          import csv
           import json
           import os
           import time
@@ -58,11 +60,12 @@ jobs:
           import urllib.request
           import xml.etree.ElementTree as ET
           from decimal import Decimal, InvalidOperation, ROUND_FLOOR, ROUND_HALF_UP
+          from pathlib import Path
 
           XML_URL = os.environ["XML_URL"]
-          BARCODE = os.environ["TEST_BARCODE"].strip()
           MODE = os.environ["RUN_MODE"].strip().upper()
           CONFIRMATION = os.environ.get("CONFIRMATION", "").strip()
+          MAX_PRODUCTS_RAW = os.environ.get("MAX_PRODUCTS", "100").strip()
 
           SELLER_ID = os.environ.get("TRENDYOL_SELLER_ID", "").strip()
           API_KEY = os.environ.get("TRENDYOL_API_KEY", "").strip()
@@ -70,7 +73,15 @@ jobs:
           STOREFRONT = os.environ.get("TRENDYOL_STOREFRONT_CODE", "TR").strip()
 
           BASE = "https://apigw.trendyol.com"
-          REPORT_PATH = "kuzgun-fiyat-kontrol-raporu.json"
+          REPORT_DIR = Path("kuzgun-bulk-price-report")
+          REPORT_DIR.mkdir(exist_ok=True)
+
+          SUMMARY_PATH = REPORT_DIR / "summary.json"
+          SAFE_CSV_PATH = REPORT_DIR / "safe_changes.csv"
+          RISKY_CSV_PATH = REPORT_DIR / "risky_changes.csv"
+          UNMATCHED_CSV_PATH = REPORT_DIR / "unmatched_xml_barcodes.csv"
+          ERRORS_CSV_PATH = REPORT_DIR / "errors.csv"
+          BATCH_RESULTS_PATH = REPORT_DIR / "batch_results.json"
 
           VAT_PERCENT = Decimal("0")
           COMMISSION_PERCENT = Decimal("20")
@@ -79,21 +90,16 @@ jobs:
           SHIPPING_RESERVE = Decimal("110")
           MINIMUM_PROFIT = Decimal("20")
           MAX_CHANGE_PERCENT = Decimal("40")
+          MIN_PRICE_DIFFERENCE = Decimal("0.01")
 
           ONE = Decimal("1")
           HUNDRED = Decimal("100")
+          PAGE_SIZE = 100
+          MAX_CLASSIC_PAGES = 100
+          UPDATE_BATCH_SIZE = 1000
 
-          report = {
-              "engine": "Kuzgun Price Engine v1.0",
-              "mode": MODE,
-              "barcode": BARCODE,
-              "xmlUrl": XML_URL,
-              "sent": False,
-          }
-
-          def save_report():
-              with open(REPORT_PATH, "w", encoding="utf-8") as handle:
-                  json.dump(report, handle, ensure_ascii=False, indent=2)
+          def decimal_text(value, places="0.01"):
+              return str(value.quantize(Decimal(places), rounding=ROUND_HALF_UP))
 
           def local_name(tag):
               return tag.rsplit("}", 1)[-1].lower()
@@ -104,18 +110,15 @@ jobs:
                       return (child.text or "").strip()
               return ""
 
-          def money(value, field):
+          def parse_positive_decimal(value, field):
               raw = str(value).strip().replace(" ", "").replace(",", ".")
               try:
                   number = Decimal(raw)
               except InvalidOperation:
-                  raise SystemExit(f"Gecersiz {field}: {value!r}")
+                  raise ValueError(f"Gecersiz {field}: {value!r}")
               if number <= 0:
-                  raise SystemExit(f"{field} sifir veya negatif olamaz: {number}")
+                  raise ValueError(f"{field} sifir veya negatif olamaz: {number}")
               return number
-
-          def decimal_text(value, places="0.01"):
-              return str(value.quantize(Decimal(places), rounding=ROUND_HALF_UP))
 
           def round_up_to_90(value):
               whole = value.to_integral_value(rounding=ROUND_FLOOR)
@@ -135,355 +138,564 @@ jobs:
                   return Decimal("17")
               return Decimal("15")
 
-          def request_json(method, url, payload=None):
+          def calculate_price(xml_price):
+              payment_cost = xml_price * PAYMENT_COST_PERCENT / HUNDRED
+              base_cost = xml_price + payment_cost + SHIPPING_RESERVE
+              profit_rate = profit_rate_for(base_cost)
+              percentage_profit = base_cost * profit_rate / HUNDRED
+              profit_amount = max(percentage_profit, MINIMUM_PROFIT)
+              required_net = base_cost + profit_amount
+
+              commission_factor = ONE - COMMISSION_PERCENT / HUNDRED
+              basket_factor = ONE - BASKET_DISCOUNT_PERCENT / HUNDRED
+
+              raw_list_price = required_net / commission_factor / basket_factor
+              target_price = round_up_to_90(raw_list_price)
+              basket_price = (
+                  target_price * basket_factor
+              ).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+              estimated_commission = (
+                  basket_price * COMMISSION_PERCENT / HUNDRED
+              ).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+              estimated_profit = (
+                  basket_price - estimated_commission - base_cost
+              ).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+
+              return {
+                  "paymentCost": payment_cost,
+                  "baseCost": base_cost,
+                  "profitRate": profit_rate,
+                  "profitAmount": profit_amount,
+                  "requiredNet": required_net,
+                  "rawListPrice": raw_list_price,
+                  "targetPrice": target_price,
+                  "basketPrice": basket_price,
+                  "estimatedProfit": estimated_profit,
+              }
+
+          def auth_headers():
               credentials = base64.b64encode(
                   f"{API_KEY}:{API_SECRET}".encode("utf-8")
               ).decode("ascii")
-              headers = {
+              return {
                   "Authorization": f"Basic {credentials}",
                   "User-Agent": f"{SELLER_ID} - SelfIntegration",
                   "storeFrontCode": STOREFRONT,
                   "Accept": "application/json",
               }
+
+          def request_json(method, url, payload=None, retries=4):
+              headers = auth_headers()
               data = None
               if payload is not None:
                   headers["Content-Type"] = "application/json"
                   data = json.dumps(payload).encode("utf-8")
 
-              request = urllib.request.Request(
-                  url,
-                  data=data,
-                  headers=headers,
-                  method=method,
+              for attempt in range(1, retries + 1):
+                  request = urllib.request.Request(
+                      url,
+                      data=data,
+                      headers=headers,
+                      method=method,
+                  )
+                  try:
+                      with urllib.request.urlopen(request, timeout=90) as response:
+                          body = response.read().decode("utf-8")
+                          return json.loads(body) if body else {}
+                  except urllib.error.HTTPError as error:
+                      body = error.read().decode("utf-8", errors="replace")
+                      retryable = error.code in {429, 500, 502, 503, 504}
+                      if retryable and attempt < retries:
+                          wait_seconds = 3 * attempt
+                          print(
+                              f"HTTP {error.code}; {wait_seconds} saniye sonra "
+                              f"tekrar deneniyor ({attempt}/{retries})..."
+                          )
+                          time.sleep(wait_seconds)
+                          continue
+                      raise RuntimeError(
+                          f"Trendyol HTTP {error.code}: {body[:2000]}"
+                      ) from None
+                  except urllib.error.URLError as error:
+                      if attempt < retries:
+                          wait_seconds = 3 * attempt
+                          print(
+                              f"Ag hatasi; {wait_seconds} saniye sonra tekrar "
+                              f"deneniyor ({attempt}/{retries}): {error}"
+                          )
+                          time.sleep(wait_seconds)
+                          continue
+                      raise RuntimeError(f"Trendyol baglanti hatasi: {error}") from None
+
+          def write_csv(path, rows, fieldnames):
+              with path.open("w", newline="", encoding="utf-8-sig") as handle:
+                  writer = csv.DictWriter(handle, fieldnames=fieldnames)
+                  writer.writeheader()
+                  writer.writerows(rows)
+
+          def load_xml_products():
+              print("Temiz XML indiriliyor...")
+              with urllib.request.urlopen(XML_URL, timeout=180) as response:
+                  tree = ET.parse(response)
+
+              products = {}
+              duplicates = []
+              errors = []
+
+              for node in tree.getroot().iter():
+                  if local_name(node.tag) != "product":
+                      continue
+
+                  barcode = child_text(node, "barkod").strip()
+                  if not barcode:
+                      continue
+
+                  if barcode in products:
+                      duplicates.append(barcode)
+                      continue
+
+                  try:
+                      price = parse_positive_decimal(
+                          child_text(node, "price"),
+                          f"XML price ({barcode})",
+                      )
+                  except ValueError as error:
+                      errors.append({
+                          "barcode": barcode,
+                          "source": "XML",
+                          "error": str(error),
+                      })
+                      continue
+
+                  products[barcode] = {
+                      "barcode": barcode,
+                      "name": child_text(node, "name"),
+                      "model": child_text(node, "model"),
+                      "quantity": child_text(node, "quantity"),
+                      "xmlPrice": price,
+                  }
+
+              return products, duplicates, errors
+
+          def load_trendyol_variants(max_products):
+              endpoint = (
+                  f"{BASE}/integration/product/sellers/{SELLER_ID}"
+                  "/products/approved/inventory-and-price"
               )
 
-              try:
-                  with urllib.request.urlopen(request, timeout=60) as response:
-                      body = response.read().decode("utf-8")
-                      return json.loads(body) if body else {}
-              except urllib.error.HTTPError as error:
-                  body = error.read().decode("utf-8", errors="replace")
-                  raise RuntimeError(
-                      f"Trendyol HTTP {error.code}: {body[:2000]}"
-                  ) from None
+              variants = {}
+              duplicates = []
+              content_count = 0
+              last_next_token = None
 
-          if not BARCODE:
-              raise SystemExit("Barkod bos olamaz.")
-          if MODE not in {"KONTROL", "UYGULA"}:
+              print("Trendyol onayli urunleri sayfa sayfa indiriliyor...")
+
+              for page in range(MAX_CLASSIC_PAGES):
+                  query = urllib.parse.urlencode({
+                      "page": page,
+                      "size": PAGE_SIZE,
+                  })
+                  response = request_json("GET", f"{endpoint}?{query}")
+                  content = response.get("content") or []
+                  last_next_token = response.get("nextPageToken") or last_next_token
+
+                  if not content:
+                      break
+
+                  for product in content:
+                      content_count += 1
+                      title = product.get("title") or ""
+                      content_id = product.get("contentId")
+                      product_main_id = product.get("productMainId")
+
+                      for variant in product.get("variants") or []:
+                          barcode = str(variant.get("barcode", "")).strip()
+                          if not barcode:
+                              continue
+                          if barcode in variants:
+                              duplicates.append(barcode)
+                              continue
+
+                          variants[barcode] = {
+                              "barcode": barcode,
+                              "title": title,
+                              "contentId": content_id,
+                              "productMainId": product_main_id,
+                              "salePrice": variant.get("salePrice"),
+                              "listPrice": variant.get("listPrice"),
+                              "quantity": variant.get("quantity"),
+                              "stockCode": variant.get("stockCode"),
+                          }
+
+                          if max_products and len(variants) >= max_products:
+                              return variants, duplicates, content_count
+
+                  print(
+                      f"Sayfa {page}: toplam {len(variants)} varyant okundu."
+                  )
+
+                  total_pages = response.get("totalPages")
+                  if total_pages is not None and page + 1 >= int(total_pages):
+                      return variants, duplicates, content_count
+
+                  if len(content) < PAGE_SIZE:
+                      return variants, duplicates, content_count
+
+              if max_products and len(variants) >= max_products:
+                  return variants, duplicates, content_count
+
+              seen_tokens = set()
+              next_token = last_next_token
+
+              while next_token:
+                  if next_token in seen_tokens:
+                      print("Tekrarlanan nextPageToken algilandi; okuma durduruldu.")
+                      break
+                  seen_tokens.add(next_token)
+
+                  query = urllib.parse.urlencode({
+                      "size": PAGE_SIZE,
+                      "nextPageToken": next_token,
+                  })
+                  response = request_json("GET", f"{endpoint}?{query}")
+                  content = response.get("content") or []
+                  if not content:
+                      break
+
+                  for product in content:
+                      content_count += 1
+                      title = product.get("title") or ""
+                      content_id = product.get("contentId")
+                      product_main_id = product.get("productMainId")
+
+                      for variant in product.get("variants") or []:
+                          barcode = str(variant.get("barcode", "")).strip()
+                          if not barcode:
+                              continue
+                          if barcode in variants:
+                              duplicates.append(barcode)
+                              continue
+
+                          variants[barcode] = {
+                              "barcode": barcode,
+                              "title": title,
+                              "contentId": content_id,
+                              "productMainId": product_main_id,
+                              "salePrice": variant.get("salePrice"),
+                              "listPrice": variant.get("listPrice"),
+                              "quantity": variant.get("quantity"),
+                              "stockCode": variant.get("stockCode"),
+                          }
+
+                          if max_products and len(variants) >= max_products:
+                              return variants, duplicates, content_count
+
+                  print(
+                      f"Token sayfasi: toplam {len(variants)} varyant okundu."
+                  )
+                  next_token = response.get("nextPageToken")
+
+              return variants, duplicates, content_count
+
+          def poll_batch(batch_id):
+              batch_url = (
+                  f"{BASE}/integration/product/sellers/{SELLER_ID}"
+                  f"/products/batch-requests/{urllib.parse.quote(batch_id)}"
+              )
+              last_result = {}
+
+              for attempt in range(1, 61):
+                  last_result = request_json("GET", batch_url)
+                  status = str(last_result.get("status", "")).upper()
+                  print(
+                      f"Batch {batch_id} sonuc sorgusu {attempt}/60: "
+                      f"{status or 'BEKLIYOR'}"
+                  )
+                  if status in {"COMPLETED", "FAILED"}:
+                      return last_result
+                  time.sleep(5)
+
+              raise RuntimeError(
+                  f"Batch 300 saniyede tamamlanmadi: {batch_id}"
+              )
+
+          if MODE not in {"TOPLU_KONTROL", "TOPLU_UYGULA"}:
               raise SystemExit("Gecersiz mod.")
+
+          try:
+              MAX_PRODUCTS = int(MAX_PRODUCTS_RAW)
+          except ValueError:
+              raise SystemExit("max_products tam sayi olmali.") from None
+
+          if MAX_PRODUCTS < 0:
+              raise SystemExit("max_products negatif olamaz.")
+
           if not all((SELLER_ID, API_KEY, API_SECRET)):
               raise SystemExit("GitHub Secrets eksik.")
 
-          print("Temiz XML indiriliyor...")
-          with urllib.request.urlopen(XML_URL, timeout=120) as response:
-              tree = ET.parse(response)
+          if MODE == "TOPLU_UYGULA" and CONFIRMATION != "TOPLU_FIYATLARI_GUNCELLE":
+              raise SystemExit(
+                  "TOPLU_UYGULA icin confirmation alanina aynen "
+                  "TOPLU_FIYATLARI_GUNCELLE yazilmali."
+              )
 
-          matches = []
-          for product in tree.getroot().iter():
-              if local_name(product.tag) != "product":
+          started_at = time.time()
+
+          xml_products, xml_duplicates, initial_errors = load_xml_products()
+          trendyol_variants, trendyol_duplicates, trendyol_content_count = (
+              load_trendyol_variants(MAX_PRODUCTS)
+          )
+
+          safe_changes = []
+          risky_changes = []
+          unmatched = []
+          errors = list(initial_errors)
+          unchanged_count = 0
+          matched_count = 0
+
+          for index, (barcode, variant) in enumerate(
+              trendyol_variants.items(),
+              start=1,
+          ):
+              xml_product = xml_products.get(barcode)
+              if not xml_product:
                   continue
-              if child_text(product, "barkod") == BARCODE:
-                  matches.append(product)
 
-          if len(matches) != 1:
-              report["xmlMatchCount"] = len(matches)
-              save_report()
-              raise SystemExit(
-                  f"Guvenlik durdurmasi: XML'de barkod {len(matches)} kez bulundu."
-              )
+              matched_count += 1
 
-          product = matches[0]
-          raw_xml_price = child_text(product, "price")
-          xml_price = money(raw_xml_price, "XML price")
-
-          payment_cost = xml_price * PAYMENT_COST_PERCENT / HUNDRED
-          base_cost = xml_price + payment_cost + SHIPPING_RESERVE
-
-          profit_rate_percent = profit_rate_for(base_cost)
-          percentage_profit = base_cost * profit_rate_percent / HUNDRED
-          profit_amount = max(percentage_profit, MINIMUM_PROFIT)
-          required_net = base_cost + profit_amount
-
-          commission_factor = ONE - COMMISSION_PERCENT / HUNDRED
-          basket_factor = ONE - BASKET_DISCOUNT_PERCENT / HUNDRED
-
-          raw_target_price = required_net / commission_factor / basket_factor
-          target_price = round_up_to_90(raw_target_price)
-          basket_price = (
-              target_price * basket_factor
-          ).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
-
-          estimated_commission = (
-              basket_price * COMMISSION_PERCENT / HUNDRED
-          ).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
-          estimated_net_after_commission = (
-              basket_price - estimated_commission
-          ).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
-          estimated_profit = (
-              estimated_net_after_commission - base_cost
-          ).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
-
-          if target_price <= 0 or target_price > Decimal("1000000"):
-              raise SystemExit(
-                  f"Guvenlik durdurmasi: hesaplanan fiyat {target_price}"
-              )
-
-          target_multiplier = target_price / xml_price
-          if target_multiplier > Decimal("10"):
-              raise SystemExit(
-                  "Guvenlik durdurmasi: hesaplanan fiyat carpani "
-                  f"cok yuksek: {target_multiplier}"
-              )
-
-          report.update({
-              "xmlMatchCount": 1,
-              "xmlProductName": child_text(product, "name"),
-              "xmlModel": child_text(product, "model"),
-              "xmlQuantity": child_text(product, "quantity"),
-              "xmlPrice": decimal_text(xml_price),
-              "vatPercent": decimal_text(VAT_PERCENT),
-              "paymentCostPercent": decimal_text(PAYMENT_COST_PERCENT),
-              "paymentCostAmount": decimal_text(payment_cost),
-              "shippingReserve": decimal_text(SHIPPING_RESERVE),
-              "baseCost": decimal_text(base_cost),
-              "profitRatePercent": decimal_text(profit_rate_percent),
-              "minimumProfit": decimal_text(MINIMUM_PROFIT),
-              "calculatedProfitAmount": decimal_text(profit_amount),
-              "requiredNet": decimal_text(required_net),
-              "commissionPercent": decimal_text(COMMISSION_PERCENT),
-              "basketDiscountPercent": decimal_text(BASKET_DISCOUNT_PERCENT),
-              "rawCalculatedListPrice": decimal_text(raw_target_price),
-              "calculatedListPrice": decimal_text(target_price),
-              "calculatedBasketPrice": decimal_text(basket_price),
-              "estimatedCommissionAmount": decimal_text(estimated_commission),
-              "estimatedNetAfterCommission": decimal_text(
-                  estimated_net_after_commission
-              ),
-              "estimatedProfitAfterRounding": decimal_text(estimated_profit),
-          })
-
-          query = urllib.parse.urlencode({"barcode": BARCODE})
-          product_url = (
-              f"{BASE}/integration/product/sellers/{SELLER_ID}"
-              f"/products/approved/inventory-and-price?{query}"
-          )
-
-          trendyol_response = request_json("GET", product_url)
-          content = trendyol_response.get("content") or []
-
-          exact = []
-          for trendyol_product in content:
-              for variant in trendyol_product.get("variants", []):
-                  if str(variant.get("barcode", "")).strip() == BARCODE:
-                      exact.append({
-                          "variant": variant,
-                          "title": trendyol_product.get("title"),
-                      })
-
-          if len(exact) != 1:
-              report["trendyolMatchCount"] = len(exact)
-              report["trendyolResponse"] = trendyol_response
-              save_report()
-              raise SystemExit(
-                  "Guvenlik durdurmasi: Trendyol'da barkod "
-                  f"{len(exact)} kez bulundu."
-              )
-
-          match = exact[0]
-          item = match["variant"]
-
-          sale_price = money(
-              item.get("salePrice"),
-              "Trendyol salePrice",
-          )
-          list_price = money(
-              item.get("listPrice"),
-              "Trendyol listPrice",
-          )
-
-          absolute_difference = abs(target_price - sale_price)
-          change_percent = (
-              absolute_difference / sale_price * HUNDRED
-          ).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
-          risky_change = change_percent > MAX_CHANGE_PERCENT
-
-          report.update({
-              "trendyolMatchCount": 1,
-              "trendyolTitle": match.get("title"),
-              "trendyolSalePrice": decimal_text(sale_price),
-              "trendyolListPrice": decimal_text(list_price),
-              "trendyolQuantity": item.get("quantity"),
-              "absolutePriceDifference": decimal_text(absolute_difference),
-              "changePercentAgainstCurrentSalePrice": decimal_text(
-                  change_percent
-              ),
-              "maximumAutomaticChangePercent": decimal_text(
-                  MAX_CHANGE_PERCENT
-              ),
-              "riskyChange": risky_change,
-              "requiredConfirmation": (
-                  "RISKLI_FIYATI_ONAYLA"
-                  if risky_change
-                  else "FIYATI_GUNCELLE"
-              ),
-              "sent": False,
-          })
-
-          save_report()
-
-          print("=" * 68)
-          print(f"URUN: {BARCODE} | {report['xmlProductName']}")
-          print(f"XML ALIS FIYATI: {decimal_text(xml_price)} TL")
-          print(
-              "ODEME MALIYETI: "
-              f"%{decimal_text(PAYMENT_COST_PERCENT)} = "
-              f"{decimal_text(payment_cost)} TL"
-          )
-          print(f"KARGO REZERVI: {decimal_text(SHIPPING_RESERVE)} TL")
-          print(f"TABAN MALIYET: {decimal_text(base_cost)} TL")
-          print(
-              "KAR: "
-              f"%{decimal_text(profit_rate_percent)} = "
-              f"{decimal_text(profit_amount)} TL"
-          )
-          print(f"GEREKLI NET: {decimal_text(required_net)} TL")
-          print(
-              "HESAPLANAN LISTE FIYATI: "
-              f"{decimal_text(target_price)} TL"
-          )
-          print(
-              "TAHMINI SEPET FIYATI: "
-              f"{decimal_text(basket_price)} TL"
-          )
-          print(
-              "TAHMINI NET KAR: "
-              f"{decimal_text(estimated_profit)} TL"
-          )
-          print(
-              "MEVCUT TRENDYOL SATIS FIYATI: "
-              f"{decimal_text(sale_price)} TL"
-          )
-          print(
-              "MEVCUT TRENDYOL LISTE FIYATI: "
-              f"{decimal_text(list_price)} TL"
-          )
-          print(
-              "FIYAT DEGISIM ORANI: "
-              f"%{decimal_text(change_percent)}"
-          )
-          print("=" * 68)
-
-          if MODE == "KONTROL":
-              if risky_change:
-                  print(
-                      "UYARI: Fiyat farki %40 sinirini asti. "
-                      "UYGULA modunda RISKLI_FIYATI_ONAYLA gerekir."
+              try:
+                  current_sale = parse_positive_decimal(
+                      variant.get("salePrice"),
+                      f"Trendyol salePrice ({barcode})",
                   )
-              print(
-                  "KONTROL modu: Trendyol'a hicbir fiyat veya stok "
-                  "gonderilmedi."
-              )
-              save_report()
-              raise SystemExit(0)
+                  current_list = parse_positive_decimal(
+                      variant.get("listPrice"),
+                      f"Trendyol listPrice ({barcode})",
+                  )
+                  calculation = calculate_price(xml_product["xmlPrice"])
+                  target_price = calculation["targetPrice"]
 
-          required_confirmation = (
-              "RISKLI_FIYATI_ONAYLA"
-              if risky_change
-              else "FIYATI_GUNCELLE"
-          )
+                  difference = abs(target_price - current_sale)
+                  change_percent = (
+                      difference / current_sale * HUNDRED
+                  ).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
 
-          if CONFIRMATION != required_confirmation:
-              raise SystemExit(
-                  "UYGULA icin confirmation alanina aynen "
-                  f"{required_confirmation} yazilmali."
-              )
+                  row = {
+                      "barcode": barcode,
+                      "xmlName": xml_product["name"],
+                      "trendyolTitle": variant["title"],
+                      "xmlPrice": decimal_text(xml_product["xmlPrice"]),
+                      "currentSalePrice": decimal_text(current_sale),
+                      "currentListPrice": decimal_text(current_list),
+                      "targetPrice": decimal_text(target_price),
+                      "basketPrice": decimal_text(calculation["basketPrice"]),
+                      "baseCost": decimal_text(calculation["baseCost"]),
+                      "profitRatePercent": decimal_text(
+                          calculation["profitRate"]
+                      ),
+                      "estimatedProfit": decimal_text(
+                          calculation["estimatedProfit"]
+                      ),
+                      "changePercent": decimal_text(change_percent),
+                  }
 
-          payload = {
-              "items": [{
-                  "barcode": BARCODE,
-                  "salePrice": float(target_price),
-                  "listPrice": float(target_price),
-              }]
-          }
+                  if difference < MIN_PRICE_DIFFERENCE:
+                      unchanged_count += 1
+                  elif change_percent > MAX_CHANGE_PERCENT:
+                      risky_changes.append(row)
+                  else:
+                      safe_changes.append(row)
 
-          update_url = (
-              f"{BASE}/integration/inventory/sellers/{SELLER_ID}"
-              "/products/price-and-inventory"
-          )
-          submitted = request_json("POST", update_url, payload)
-          batch_id = submitted.get("batchRequestId")
+              except Exception as error:
+                  errors.append({
+                      "barcode": barcode,
+                      "source": "HESAPLAMA",
+                      "error": str(error),
+                  })
 
-          if not batch_id:
-              report["submitResponse"] = submitted
-              save_report()
-              raise SystemExit("Trendyol batchRequestId dondurmedi.")
+              if index % 500 == 0:
+                  print(
+                      f"Analiz: {index}/{len(trendyol_variants)} varyant islendi."
+                  )
 
-          report.update({
-              "sent": True,
-              "batchRequestId": batch_id,
-          })
-          save_report()
-          print(f"Trendyol kabul etti. batchRequestId={batch_id}")
+          for barcode, xml_product in xml_products.items():
+              if barcode not in trendyol_variants:
+                  unmatched.append({
+                      "barcode": barcode,
+                      "xmlName": xml_product["name"],
+                      "xmlPrice": decimal_text(xml_product["xmlPrice"]),
+                  })
 
-          batch_url = (
-              f"{BASE}/integration/product/sellers/{SELLER_ID}"
-              f"/products/batch-requests/{urllib.parse.quote(batch_id)}"
-          )
-
-          result = {}
-          for attempt in range(1, 31):
-              result = request_json("GET", batch_url)
-              status = str(result.get("status", "")).upper()
-              print(
-                  f"Sonuc sorgusu {attempt}/30: "
-                  f"{status or 'BEKLIYOR'}"
-              )
-              if status in {"COMPLETED", "FAILED"}:
-                  break
-              time.sleep(5)
-          else:
-              report["batchResult"] = result
-              save_report()
-              raise SystemExit(
-                  "Batch 150 saniyede tamamlanmadi."
-              )
-
-          report["batchResult"] = result
-          save_report()
-
-          items = result.get("items") or []
-          failed_items = [
-              batch_item
-              for batch_item in items
-              if str(batch_item.get("status", "")).upper() != "SUCCESS"
+          common_fields = [
+              "barcode",
+              "xmlName",
+              "trendyolTitle",
+              "xmlPrice",
+              "currentSalePrice",
+              "currentListPrice",
+              "targetPrice",
+              "basketPrice",
+              "baseCost",
+              "profitRatePercent",
+              "estimatedProfit",
+              "changePercent",
           ]
 
-          if str(result.get("status", "")).upper() != "COMPLETED":
-              raise SystemExit(
-                  f"Batch basarisiz: {result.get('status')}"
-              )
-
-          if int(result.get("failedItemCount") or 0) or failed_items:
-              reasons = [
-                  batch_item.get("failureReasons")
-                  for batch_item in failed_items
-              ]
-              raise SystemExit(
-                  f"Fiyat guncellenemedi: {reasons}"
-              )
-
-          print(
-              "BASARILI: Trendyol "
-              f"{BARCODE} barkodunun fiyatini "
-              f"{decimal_text(target_price)} TL olarak tamamladi."
+          write_csv(SAFE_CSV_PATH, safe_changes, common_fields)
+          write_csv(RISKY_CSV_PATH, risky_changes, common_fields)
+          write_csv(
+              UNMATCHED_CSV_PATH,
+              unmatched,
+              ["barcode", "xmlName", "xmlPrice"],
           )
+          write_csv(
+              ERRORS_CSV_PATH,
+              errors,
+              ["barcode", "source", "error"],
+          )
+
+          batch_results = []
+          submitted_count = 0
+          successful_count = 0
+          failed_count = 0
+
+          if MODE == "TOPLU_UYGULA":
+              update_url = (
+                  f"{BASE}/integration/inventory/sellers/{SELLER_ID}"
+                  "/products/price-and-inventory"
+              )
+
+              for start in range(0, len(safe_changes), UPDATE_BATCH_SIZE):
+                  group = safe_changes[start:start + UPDATE_BATCH_SIZE]
+                  payload = {
+                      "items": [
+                          {
+                              "barcode": row["barcode"],
+                              "salePrice": float(row["targetPrice"]),
+                              "listPrice": float(row["targetPrice"]),
+                          }
+                          for row in group
+                      ]
+                  }
+
+                  print(
+                      f"Batch gonderiliyor: {start + 1}-"
+                      f"{start + len(group)} / {len(safe_changes)}"
+                  )
+                  submitted = request_json("POST", update_url, payload)
+                  batch_id = submitted.get("batchRequestId")
+
+                  if not batch_id:
+                      raise RuntimeError(
+                          f"Trendyol batchRequestId dondurmedi: {submitted}"
+                      )
+
+                  submitted_count += len(group)
+                  result = poll_batch(batch_id)
+                  batch_results.append({
+                      "batchRequestId": batch_id,
+                      "itemCount": len(group),
+                      "result": result,
+                  })
+
+                  result_items = result.get("items") or []
+                  group_failed = [
+                      item for item in result_items
+                      if str(item.get("status", "")).upper() != "SUCCESS"
+                  ]
+                  explicit_failed = int(result.get("failedItemCount") or 0)
+                  group_failed_count = max(
+                      explicit_failed,
+                      len(group_failed),
+                  )
+                  failed_count += group_failed_count
+                  successful_count += len(group) - group_failed_count
+
+                  if str(result.get("status", "")).upper() != "COMPLETED":
+                      raise RuntimeError(
+                          f"Batch basarisiz: {batch_id} / "
+                          f"{result.get('status')}"
+                      )
+
+                  if start + UPDATE_BATCH_SIZE < len(safe_changes):
+                      time.sleep(2)
+
+          with BATCH_RESULTS_PATH.open("w", encoding="utf-8") as handle:
+              json.dump(batch_results, handle, ensure_ascii=False, indent=2)
+
+          summary = {
+              "engine": "Kuzgun Bulk Price Engine v1.0",
+              "mode": MODE,
+              "maxProducts": MAX_PRODUCTS,
+              "xmlUrl": XML_URL,
+              "rules": {
+                  "vatPercent": decimal_text(VAT_PERCENT),
+                  "commissionPercent": decimal_text(COMMISSION_PERCENT),
+                  "paymentCostPercent": decimal_text(PAYMENT_COST_PERCENT),
+                  "basketDiscountPercent": decimal_text(
+                      BASKET_DISCOUNT_PERCENT
+                  ),
+                  "shippingReserve": decimal_text(SHIPPING_RESERVE),
+                  "minimumProfit": decimal_text(MINIMUM_PROFIT),
+                  "maximumAutomaticChangePercent": decimal_text(
+                      MAX_CHANGE_PERCENT
+                  ),
+              },
+              "counts": {
+                  "xmlUniqueProducts": len(xml_products),
+                  "xmlDuplicateBarcodes": len(xml_duplicates),
+                  "trendyolContentsRead": trendyol_content_count,
+                  "trendyolUniqueVariants": len(trendyol_variants),
+                  "trendyolDuplicateBarcodes": len(trendyol_duplicates),
+                  "matchedBarcodes": matched_count,
+                  "unmatchedXmlBarcodes": len(unmatched),
+                  "unchangedPrices": unchanged_count,
+                  "safeChanges": len(safe_changes),
+                  "riskyChanges": len(risky_changes),
+                  "errors": len(errors),
+                  "submitted": submitted_count,
+                  "successful": successful_count,
+                  "failed": failed_count,
+              },
+              "durationSeconds": round(time.time() - started_at, 2),
+              "sent": MODE == "TOPLU_UYGULA" and submitted_count > 0,
+          }
+
+          with SUMMARY_PATH.open("w", encoding="utf-8") as handle:
+              json.dump(summary, handle, ensure_ascii=False, indent=2)
+
+          print("=" * 72)
+          print("KUZGUN BULK PRICE ENGINE v1.0 SONUCU")
+          print(f"MOD: {MODE}")
+          print(f"XML TEKIL URUN: {len(xml_products)}")
+          print(f"TRENDYOL OKUNAN VARYANT: {len(trendyol_variants)}")
+          print(f"ESLESEN BARKOD: {matched_count}")
+          print(f"ESLESMEYEN XML BARKOD: {len(unmatched)}")
+          print(f"DEGISMEYEN FIYAT: {unchanged_count}")
+          print(f"GUVENLI DEGISEN: {len(safe_changes)}")
+          print(f"RISKLI DEGISEN: {len(risky_changes)}")
+          print(f"HATALI: {len(errors)}")
+          print(f"GONDERILEN: {submitted_count}")
+          print(f"BASARILI: {successful_count}")
+          print(f"BASARISIZ: {failed_count}")
+          print("=" * 72)
+
+          if MODE == "TOPLU_KONTROL":
+              print(
+                  "TOPLU_KONTROL modu: Trendyol'a hicbir fiyat veya stok "
+                  "gonderilmedi."
+              )
+          else:
+              print(
+                  "TOPLU_UYGULA tamamlandi. Riskli fiyatlar gonderilmedi."
+              )
           PY
 
-      - name: Kuzgun fiyat raporunu sakla
+      - name: Toplu fiyat raporunu sakla
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: kuzgun-fiyat-raporu-${{ inputs.barcode }}
-          path: kuzgun-fiyat-kontrol-raporu.json
+          name: kuzgun-bulk-price-report-${{ github.run_number }}
+          path: kuzgun-bulk-price-report
           if-no-files-found: warn
           retention-days: 30
