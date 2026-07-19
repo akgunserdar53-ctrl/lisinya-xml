@@ -1,1 +1,251 @@
+name: Trendyol tek urun stok koprusu TEST
+
+on:
+  workflow_dispatch:
+    inputs:
+      barcode:
+        description: "Test edilecek tek barkod"
+        required: true
+        default: "9786051008608"
+        type: string
+      mode:
+        description: "KONTROL veri gondermez; UYGULA Trendyol'a stok gonderir"
+        required: true
+        default: "KONTROL"
+        type: choice
+        options:
+          - KONTROL
+          - UYGULA
+      confirmation:
+        description: "UYGULA icin aynen STOKU_GUNCELLE yazin"
+        required: false
+        default: ""
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: trendyol-tek-urun-stok-test
+  cancel-in-progress: false
+
+jobs:
+  single-product-stock-test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      XML_URL: https://akgunserdar53-ctrl.github.io/lisinya-xml/lisinyakitap-guncel.xml
+      TEST_BARCODE: ${{ inputs.barcode }}
+      RUN_MODE: ${{ inputs.mode }}
+      CONFIRMATION: ${{ inputs.confirmation }}
+      TRENDYOL_SELLER_ID: ${{ secrets.TRENDYOL_SELLER_ID }}
+      TRENDYOL_API_KEY: ${{ secrets.TRENDYOL_API_KEY }}
+      TRENDYOL_API_SECRET: ${{ secrets.TRENDYOL_API_SECRET }}
+      TRENDYOL_STOREFRONT_CODE: TR
+
+    steps:
+      - name: Tek barkodu XML'de bul ve guvenli stok testi yap
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import base64
+          import json
+          import os
+          import sys
+          import time
+          import urllib.error
+          import urllib.parse
+          import urllib.request
+          import xml.etree.ElementTree as ET
+
+          XML_URL = os.environ["XML_URL"]
+          BARCODE = os.environ["TEST_BARCODE"].strip()
+          MODE = os.environ["RUN_MODE"].strip().upper()
+          CONFIRMATION = os.environ.get("CONFIRMATION", "")
+          SELLER_ID = os.environ.get("TRENDYOL_SELLER_ID", "").strip()
+          API_KEY = os.environ.get("TRENDYOL_API_KEY", "").strip()
+          API_SECRET = os.environ.get("TRENDYOL_API_SECRET", "").strip()
+          STOREFRONT = os.environ.get("TRENDYOL_STOREFRONT_CODE", "TR")
+          BASE = "https://apigw.trendyol.com"
+          REPORT_PATH = "trendyol-stok-test-raporu.json"
+
+          report = {
+              "mode": MODE,
+              "barcode": BARCODE,
+              "xmlUrl": XML_URL,
+              "sent": False,
+          }
+
+          def save_report():
+              with open(REPORT_PATH, "w", encoding="utf-8") as handle:
+                  json.dump(report, handle, ensure_ascii=False, indent=2)
+
+          def local_name(tag):
+              return tag.rsplit("}", 1)[-1].lower()
+
+          def child_text(product, wanted):
+              for child in product:
+                  if local_name(child.tag) == wanted:
+                      return (child.text or "").strip()
+              return ""
+
+          def request_json(method, url, payload=None):
+              credentials = base64.b64encode(
+                  f"{API_KEY}:{API_SECRET}".encode("utf-8")
+              ).decode("ascii")
+              headers = {
+                  "Authorization": f"Basic {credentials}",
+                  "User-Agent": f"{SELLER_ID} - SelfIntegration",
+                  "storeFrontCode": STOREFRONT,
+                  "Accept": "application/json",
+              }
+              data = None
+              if payload is not None:
+                  headers["Content-Type"] = "application/json"
+                  data = json.dumps(payload).encode("utf-8")
+              request = urllib.request.Request(
+                  url, data=data, headers=headers, method=method
+              )
+              try:
+                  with urllib.request.urlopen(request, timeout=60) as response:
+                      body = response.read().decode("utf-8")
+                      return json.loads(body) if body else {}
+              except urllib.error.HTTPError as error:
+                  body = error.read().decode("utf-8", errors="replace")
+                  raise RuntimeError(
+                      f"Trendyol HTTP {error.code}: {body[:2000]}"
+                  ) from None
+
+          if not BARCODE:
+              raise SystemExit("Barkod bos olamaz.")
+          if MODE not in {"KONTROL", "UYGULA"}:
+              raise SystemExit("Gecersiz mod.")
+
+          print("Temiz XML indiriliyor...")
+          with urllib.request.urlopen(XML_URL, timeout=120) as response:
+              tree = ET.parse(response)
+
+          matches = []
+          for product in tree.getroot().iter():
+              if local_name(product.tag) != "product":
+                  continue
+              if child_text(product, "barkod") == BARCODE:
+                  matches.append(product)
+
+          if len(matches) != 1:
+              report["xmlMatchCount"] = len(matches)
+              save_report()
+              raise SystemExit(
+                  f"Guvenlik durdurmasi: XML'de barkod {len(matches)} kez bulundu."
+              )
+
+          product = matches[0]
+          raw_quantity = child_text(product, "quantity")
+          try:
+              quantity_number = float(raw_quantity.replace(",", "."))
+              if quantity_number < 0 or not quantity_number.is_integer():
+                  raise ValueError
+              quantity = int(quantity_number)
+          except ValueError:
+              report["rawQuantity"] = raw_quantity
+              save_report()
+              raise SystemExit(f"Gecersiz XML stogu: {raw_quantity!r}")
+
+          if quantity > 20000:
+              save_report()
+              raise SystemExit(f"Guvenlik durdurmasi: stok 20000 ustunde: {quantity}")
+
+          report.update({
+              "xmlMatchCount": 1,
+              "xmlQuantity": quantity,
+              "xmlProductName": child_text(product, "name"),
+              "xmlModel": child_text(product, "model"),
+          })
+          save_report()
+
+          print(
+              f"KONTROL: {BARCODE} | {report['xmlProductName']} | "
+              f"XML stogu={quantity}"
+          )
+
+          if MODE == "KONTROL":
+              print("KONTROL modu: Trendyol'a hicbir veri gonderilmedi.")
+              sys.exit(0)
+
+          if CONFIRMATION != "STOKU_GUNCELLE":
+              raise SystemExit(
+                  "UYGULA icin confirmation alanina STOKU_GUNCELLE yazilmali."
+              )
+          if not all((SELLER_ID, API_KEY, API_SECRET)):
+              raise SystemExit(
+                  "GitHub Secrets eksik: TRENDYOL_SELLER_ID, "
+                  "TRENDYOL_API_KEY, TRENDYOL_API_SECRET"
+              )
+
+          # Fiyat alanlari bilerek gonderilmiyor. Resmi servis stok ve fiyati
+          # ayri ayri kabul eder; boylece mevcut Trendyol fiyati korunur.
+          payload = {"items": [{"barcode": BARCODE, "quantity": quantity}]}
+          update_url = (
+              f"{BASE}/integration/inventory/sellers/{SELLER_ID}"
+              "/products/price-and-inventory"
+          )
+          submitted = request_json("POST", update_url, payload)
+          batch_id = submitted.get("batchRequestId")
+          if not batch_id:
+              report["submitResponse"] = submitted
+              save_report()
+              raise SystemExit("Trendyol batchRequestId dondurmedi.")
+
+          report.update({"sent": True, "batchRequestId": batch_id})
+          save_report()
+          print(f"Trendyol kabul etti. batchRequestId={batch_id}")
+
+          batch_url = (
+              f"{BASE}/integration/product/sellers/{SELLER_ID}"
+              f"/products/batch-requests/{urllib.parse.quote(batch_id)}"
+          )
+          terminal = {"COMPLETED", "FAILED"}
+          result = {}
+          for attempt in range(1, 31):
+              result = request_json("GET", batch_url)
+              status = str(result.get("status", "")).upper()
+              print(f"Sonuc sorgusu {attempt}/30: {status or 'BEKLIYOR'}")
+              if status in terminal:
+                  break
+              time.sleep(5)
+          else:
+              report["batchResult"] = result
+              save_report()
+              raise SystemExit("Batch 150 saniyede tamamlanmadi.")
+
+          report["batchResult"] = result
+          save_report()
+
+          items = result.get("items") or []
+          failed_items = [
+              item for item in items
+              if str(item.get("status", "")).upper() != "SUCCESS"
+          ]
+          failed_count = int(result.get("failedItemCount") or 0)
+          if str(result.get("status", "")).upper() != "COMPLETED":
+              raise SystemExit(f"Batch basarisiz: {result.get('status')}")
+          if failed_count or failed_items:
+              reasons = [item.get("failureReasons") for item in failed_items]
+              raise SystemExit(f"Urun guncellenemedi: {reasons}")
+
+          print(
+              f"BASARILI: Trendyol {BARCODE} barkodunun stok guncellemesini "
+              f"tamamladi. Yeni stok={quantity}"
+          )
+          PY
+
+      - name: Test raporunu sakla
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: trendyol-stok-test-raporu-${{ inputs.barcode }}
+          path: trendyol-stok-test-raporu.json
+          if-no-files-found: warn
+          retention-days: 30
 
