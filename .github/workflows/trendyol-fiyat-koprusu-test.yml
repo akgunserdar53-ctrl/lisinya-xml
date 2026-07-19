@@ -209,48 +209,67 @@ jobs:
 
           query = urllib.parse.urlencode({
               "barcode": BARCODE,
-              "page": 0,
-              "size": 10,
           })
+
           product_url = (
               f"{BASE}/integration/product/sellers/{SELLER_ID}"
-              f"/products/approved?{query}"
+              f"/products/approved/inventory-and-price?{query}"
           )
+
           trendyol_response = request_json("GET", product_url)
           content = trendyol_response.get("content") or []
-          exact = [
-              item for item in content
-              if str(item.get("barcode", "")).strip() == BARCODE
-          ]
+
+          exact = []
+          for trendyol_product in content:
+              for variant in trendyol_product.get("variants", []):
+                  if str(variant.get("barcode", "")).strip() == BARCODE:
+                      exact.append({
+                          "variant": variant,
+                          "title": trendyol_product.get("title"),
+                      })
+
           if len(exact) != 1:
               report["trendyolMatchCount"] = len(exact)
-              report["trendyolTotalElements"] = trendyol_response.get(
-                  "totalElements"
-              )
+              report["trendyolResponse"] = trendyol_response
               save_report()
               raise SystemExit(
-                  f"Guvenlik durdurmasi: Trendyol'da barkod {len(exact)} kez bulundu."
+                  f"Guvenlik durdurmasi: Trendyol'da barkod "
+                  f"{len(exact)} kez bulundu."
               )
 
-          item = exact[0]
-          sale_price = money(item.get("salePrice"), "Trendyol salePrice")
-          list_price = money(item.get("listPrice"), "Trendyol listPrice")
+          match = exact[0]
+          item = match["variant"]
+
+          sale_price = money(
+              item.get("salePrice"),
+              "Trendyol salePrice"
+          )
+          list_price = money(
+              item.get("listPrice"),
+              "Trendyol listPrice"
+          )
+
           multiplier = sale_price / xml_price
-          increase_percent = (multiplier - Decimal("1")) * Decimal("100")
+          increase_percent = (
+              multiplier - Decimal("1")
+          ) * Decimal("100")
+
           report.update({
               "trendyolMatchCount": 1,
-              "trendyolTitle": item.get("title"),
+              "trendyolTitle": match.get("title"),
               "trendyolSalePrice": str(sale_price),
               "trendyolListPrice": str(list_price),
               "trendyolQuantity": item.get("quantity"),
-              "salePriceDividedByXmlPrice": str(multiplier.quantize(Decimal("0.0001"))),
+              "salePriceDividedByXmlPrice": str(
+                  multiplier.quantize(Decimal("0.0001"))
+              ),
               "increasePercentOverXmlPrice": str(
                   increase_percent.quantize(Decimal("0.01"))
               ),
               "sent": False,
           })
-          save_report()
 
+          save_report()
           print(f"URUN: {BARCODE} | {report['xmlProductName']}")
           print(f"XML HAM FIYAT: {xml_price} TL")
           print(f"TRENDYOL SATIS FIYATI: {sale_price} TL")
