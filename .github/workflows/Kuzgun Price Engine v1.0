@@ -1,4 +1,4 @@
-name: Trendyol tek urun fiyat koprusu TEST V2
+name: Kuzgun Price Engine v1.0
 
 on:
   workflow_dispatch:
@@ -7,21 +7,6 @@ on:
         description: "Fiyati incelenecek tek barkod"
         required: true
         default: "9786051008608"
-        type: string
-      net_profit_percent:
-        description: "Net kar orani (komisyon haric)"
-        required: true
-        default: "30"
-        type: string
-      vat_percent:
-        description: "XML alis fiyatinin icindeki KDV orani"
-        required: true
-        default: "20"
-        type: string
-      commission_percent:
-        description: "Pazaryeri komisyon orani"
-        required: true
-        default: "30"
         type: string
       mode:
         description: "KONTROL gondermez; UYGULA tek urunun fiyatini gonderir"
@@ -32,7 +17,7 @@ on:
           - KONTROL
           - UYGULA
       confirmation:
-        description: "UYGULA icin aynen FIYATI_GUNCELLE yazin"
+        description: "Normal uygulama: FIYATI_GUNCELLE | Fark %40'tan buyukse: RISKLI_FIYATI_ONAYLA"
         required: false
         default: ""
         type: string
@@ -41,7 +26,7 @@ permissions:
   contents: read
 
 concurrency:
-  group: trendyol-tek-urun-fiyat-kontrol
+  group: kuzgun-price-engine-single-product
   cancel-in-progress: false
 
 jobs:
@@ -51,9 +36,6 @@ jobs:
     env:
       XML_URL: https://akgunserdar53-ctrl.github.io/lisinya-xml/lisinyakitap-guncel.xml
       TEST_BARCODE: ${{ inputs.barcode }}
-      NET_PROFIT_PERCENT: ${{ inputs.net_profit_percent }}
-      VAT_PERCENT: ${{ inputs.vat_percent }}
-      COMMISSION_PERCENT: ${{ inputs.commission_percent }}
       RUN_MODE: ${{ inputs.mode }}
       CONFIRMATION: ${{ inputs.confirmation }}
       TRENDYOL_SELLER_ID: ${{ secrets.TRENDYOL_SELLER_ID }}
@@ -62,7 +44,7 @@ jobs:
       TRENDYOL_STOREFRONT_CODE: TR
 
     steps:
-      - name: XML fiyatini hesapla ve guvenli fiyat testi yap
+      - name: Kuzgun fiyat motorunu calistir
         shell: bash
         run: |
           set -euo pipefail
@@ -70,28 +52,39 @@ jobs:
           import base64
           import json
           import os
+          import time
           import urllib.error
           import urllib.parse
           import urllib.request
           import xml.etree.ElementTree as ET
-          import time
-          from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
+          from decimal import Decimal, InvalidOperation, ROUND_FLOOR, ROUND_HALF_UP
 
           XML_URL = os.environ["XML_URL"]
           BARCODE = os.environ["TEST_BARCODE"].strip()
           MODE = os.environ["RUN_MODE"].strip().upper()
-          CONFIRMATION = os.environ.get("CONFIRMATION", "")
-          NET_PROFIT = Decimal(os.environ["NET_PROFIT_PERCENT"])
-          VAT = Decimal(os.environ["VAT_PERCENT"])
-          COMMISSION = Decimal(os.environ["COMMISSION_PERCENT"])
+          CONFIRMATION = os.environ.get("CONFIRMATION", "").strip()
+
           SELLER_ID = os.environ.get("TRENDYOL_SELLER_ID", "").strip()
           API_KEY = os.environ.get("TRENDYOL_API_KEY", "").strip()
           API_SECRET = os.environ.get("TRENDYOL_API_SECRET", "").strip()
-          STOREFRONT = os.environ.get("TRENDYOL_STOREFRONT_CODE", "TR")
+          STOREFRONT = os.environ.get("TRENDYOL_STOREFRONT_CODE", "TR").strip()
+
           BASE = "https://apigw.trendyol.com"
-          REPORT_PATH = "trendyol-fiyat-kontrol-raporu.json"
+          REPORT_PATH = "kuzgun-fiyat-kontrol-raporu.json"
+
+          VAT_PERCENT = Decimal("0")
+          COMMISSION_PERCENT = Decimal("20")
+          PAYMENT_COST_PERCENT = Decimal("4")
+          BASKET_DISCOUNT_PERCENT = Decimal("10")
+          SHIPPING_RESERVE = Decimal("110")
+          MINIMUM_PROFIT = Decimal("20")
+          MAX_CHANGE_PERCENT = Decimal("40")
+
+          ONE = Decimal("1")
+          HUNDRED = Decimal("100")
 
           report = {
+              "engine": "Kuzgun Price Engine v1.0",
               "mode": MODE,
               "barcode": BARCODE,
               "xmlUrl": XML_URL,
@@ -121,6 +114,27 @@ jobs:
                   raise SystemExit(f"{field} sifir veya negatif olamaz: {number}")
               return number
 
+          def decimal_text(value, places="0.01"):
+              return str(value.quantize(Decimal(places), rounding=ROUND_HALF_UP))
+
+          def round_up_to_90(value):
+              whole = value.to_integral_value(rounding=ROUND_FLOOR)
+              candidate = whole + Decimal("0.90")
+              if candidate < value:
+                  candidate += Decimal("1.00")
+              return candidate.quantize(Decimal("0.00"))
+
+          def profit_rate_for(base_cost):
+              if base_cost <= Decimal("50"):
+                  return Decimal("30")
+              if base_cost <= Decimal("100"):
+                  return Decimal("25")
+              if base_cost <= Decimal("200"):
+                  return Decimal("20")
+              if base_cost <= Decimal("500"):
+                  return Decimal("17")
+              return Decimal("15")
+
           def request_json(method, url, payload=None):
               credentials = base64.b64encode(
                   f"{API_KEY}:{API_SECRET}".encode("utf-8")
@@ -135,9 +149,14 @@ jobs:
               if payload is not None:
                   headers["Content-Type"] = "application/json"
                   data = json.dumps(payload).encode("utf-8")
+
               request = urllib.request.Request(
-                  url, data=data, headers=headers, method=method
+                  url,
+                  data=data,
+                  headers=headers,
+                  method=method,
               )
+
               try:
                   with urllib.request.urlopen(request, timeout=60) as response:
                       body = response.read().decode("utf-8")
@@ -152,10 +171,6 @@ jobs:
               raise SystemExit("Barkod bos olamaz.")
           if MODE not in {"KONTROL", "UYGULA"}:
               raise SystemExit("Gecersiz mod.")
-          if NET_PROFIT < 0 or VAT < 0:
-              raise SystemExit("Kar ve KDV negatif olamaz.")
-          if COMMISSION < 0 or COMMISSION >= 100:
-              raise SystemExit("Komisyon 0 dahil, 100 haric araliginda olmali.")
           if not all((SELLER_ID, API_KEY, API_SECRET)):
               raise SystemExit("GitHub Secrets eksik.")
 
@@ -180,37 +195,74 @@ jobs:
           product = matches[0]
           raw_xml_price = child_text(product, "price")
           xml_price = money(raw_xml_price, "XML price")
-          # XML ayarinda alis fiyati KDV dahil oldugu icin KDV tekrar
-          # carpilmiyor. PazarAPI tablosundaki artis formulu:
-          # satis = alis * (1 + net kar) / (1 - komisyon)
-          target_price = (
-              xml_price
-              * (Decimal("1") + NET_PROFIT / Decimal("100"))
-              / (Decimal("1") - COMMISSION / Decimal("100"))
+
+          payment_cost = xml_price * PAYMENT_COST_PERCENT / HUNDRED
+          base_cost = xml_price + payment_cost + SHIPPING_RESERVE
+
+          profit_rate_percent = profit_rate_for(base_cost)
+          percentage_profit = base_cost * profit_rate_percent / HUNDRED
+          profit_amount = max(percentage_profit, MINIMUM_PROFIT)
+          required_net = base_cost + profit_amount
+
+          commission_factor = ONE - COMMISSION_PERCENT / HUNDRED
+          basket_factor = ONE - BASKET_DISCOUNT_PERCENT / HUNDRED
+
+          raw_target_price = required_net / commission_factor / basket_factor
+          target_price = round_up_to_90(raw_target_price)
+          basket_price = (
+              target_price * basket_factor
           ).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
-          target_multiplier = target_price / xml_price
+
+          estimated_commission = (
+              basket_price * COMMISSION_PERCENT / HUNDRED
+          ).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+          estimated_net_after_commission = (
+              basket_price - estimated_commission
+          ).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+          estimated_profit = (
+              estimated_net_after_commission - base_cost
+          ).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+
           if target_price <= 0 or target_price > Decimal("1000000"):
-              raise SystemExit(f"Guvenlik durdurmasi: hesaplanan fiyat {target_price}")
-          if target_multiplier > Decimal("5"):
               raise SystemExit(
-                  f"Guvenlik durdurmasi: fiyat carpani cok yuksek: {target_multiplier}"
+                  f"Guvenlik durdurmasi: hesaplanan fiyat {target_price}"
               )
+
+          target_multiplier = target_price / xml_price
+          if target_multiplier > Decimal("10"):
+              raise SystemExit(
+                  "Guvenlik durdurmasi: hesaplanan fiyat carpani "
+                  f"cok yuksek: {target_multiplier}"
+              )
+
           report.update({
               "xmlMatchCount": 1,
               "xmlProductName": child_text(product, "name"),
               "xmlModel": child_text(product, "model"),
               "xmlQuantity": child_text(product, "quantity"),
-              "xmlPrice": str(xml_price),
-              "netProfitPercent": str(NET_PROFIT),
-              "vatPercentAlreadyIncludedInXmlPrice": str(VAT),
-              "commissionPercent": str(COMMISSION),
-              "calculatedSalePrice": str(target_price),
+              "xmlPrice": decimal_text(xml_price),
+              "vatPercent": decimal_text(VAT_PERCENT),
+              "paymentCostPercent": decimal_text(PAYMENT_COST_PERCENT),
+              "paymentCostAmount": decimal_text(payment_cost),
+              "shippingReserve": decimal_text(SHIPPING_RESERVE),
+              "baseCost": decimal_text(base_cost),
+              "profitRatePercent": decimal_text(profit_rate_percent),
+              "minimumProfit": decimal_text(MINIMUM_PROFIT),
+              "calculatedProfitAmount": decimal_text(profit_amount),
+              "requiredNet": decimal_text(required_net),
+              "commissionPercent": decimal_text(COMMISSION_PERCENT),
+              "basketDiscountPercent": decimal_text(BASKET_DISCOUNT_PERCENT),
+              "rawCalculatedListPrice": decimal_text(raw_target_price),
+              "calculatedListPrice": decimal_text(target_price),
+              "calculatedBasketPrice": decimal_text(basket_price),
+              "estimatedCommissionAmount": decimal_text(estimated_commission),
+              "estimatedNetAfterCommission": decimal_text(
+                  estimated_net_after_commission
+              ),
+              "estimatedProfitAfterRounding": decimal_text(estimated_profit),
           })
 
-          query = urllib.parse.urlencode({
-              "barcode": BARCODE,
-          })
-
+          query = urllib.parse.urlencode({"barcode": BARCODE})
           product_url = (
               f"{BASE}/integration/product/sellers/{SELLER_ID}"
               f"/products/approved/inventory-and-price?{query}"
@@ -233,7 +285,7 @@ jobs:
               report["trendyolResponse"] = trendyol_response
               save_report()
               raise SystemExit(
-                  f"Guvenlik durdurmasi: Trendyol'da barkod "
+                  "Guvenlik durdurmasi: Trendyol'da barkod "
                   f"{len(exact)} kez bulundu."
               )
 
@@ -242,58 +294,110 @@ jobs:
 
           sale_price = money(
               item.get("salePrice"),
-              "Trendyol salePrice"
+              "Trendyol salePrice",
           )
           list_price = money(
               item.get("listPrice"),
-              "Trendyol listPrice"
+              "Trendyol listPrice",
           )
 
-          multiplier = sale_price / xml_price
-          increase_percent = (
-              multiplier - Decimal("1")
-          ) * Decimal("100")
+          absolute_difference = abs(target_price - sale_price)
+          change_percent = (
+              absolute_difference / sale_price * HUNDRED
+          ).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+          risky_change = change_percent > MAX_CHANGE_PERCENT
 
           report.update({
               "trendyolMatchCount": 1,
               "trendyolTitle": match.get("title"),
-              "trendyolSalePrice": str(sale_price),
-              "trendyolListPrice": str(list_price),
+              "trendyolSalePrice": decimal_text(sale_price),
+              "trendyolListPrice": decimal_text(list_price),
               "trendyolQuantity": item.get("quantity"),
-              "salePriceDividedByXmlPrice": str(
-                  multiplier.quantize(Decimal("0.0001"))
+              "absolutePriceDifference": decimal_text(absolute_difference),
+              "changePercentAgainstCurrentSalePrice": decimal_text(
+                  change_percent
               ),
-              "increasePercentOverXmlPrice": str(
-                  increase_percent.quantize(Decimal("0.01"))
+              "maximumAutomaticChangePercent": decimal_text(
+                  MAX_CHANGE_PERCENT
+              ),
+              "riskyChange": risky_change,
+              "requiredConfirmation": (
+                  "RISKLI_FIYATI_ONAYLA"
+                  if risky_change
+                  else "FIYATI_GUNCELLE"
               ),
               "sent": False,
           })
 
           save_report()
+
+          print("=" * 68)
           print(f"URUN: {BARCODE} | {report['xmlProductName']}")
-          print(f"XML HAM FIYAT: {xml_price} TL")
-          print(f"TRENDYOL SATIS FIYATI: {sale_price} TL")
-          print(f"TRENDYOL LISTE FIYATI: {list_price} TL")
-          print(f"MEVCUT CARPAN: {multiplier.quantize(Decimal('0.0001'))}")
-          print(f"XML UZERINE FARK: %{increase_percent.quantize(Decimal('0.01'))}")
+          print(f"XML ALIS FIYATI: {decimal_text(xml_price)} TL")
           print(
-              f"PAZARAPI FORMULU: %{NET_PROFIT} net kar, "
-              f"%{COMMISSION} komisyon; XML fiyatinda %{VAT} KDV zaten dahil"
+              "ODEME MALIYETI: "
+              f"%{decimal_text(PAYMENT_COST_PERCENT)} = "
+              f"{decimal_text(payment_cost)} TL"
           )
-          print(f"HESAPLANAN YENI SATIS FIYATI: {target_price} TL")
+          print(f"KARGO REZERVI: {decimal_text(SHIPPING_RESERVE)} TL")
+          print(f"TABAN MALIYET: {decimal_text(base_cost)} TL")
+          print(
+              "KAR: "
+              f"%{decimal_text(profit_rate_percent)} = "
+              f"{decimal_text(profit_amount)} TL"
+          )
+          print(f"GEREKLI NET: {decimal_text(required_net)} TL")
+          print(
+              "HESAPLANAN LISTE FIYATI: "
+              f"{decimal_text(target_price)} TL"
+          )
+          print(
+              "TAHMINI SEPET FIYATI: "
+              f"{decimal_text(basket_price)} TL"
+          )
+          print(
+              "TAHMINI NET KAR: "
+              f"{decimal_text(estimated_profit)} TL"
+          )
+          print(
+              "MEVCUT TRENDYOL SATIS FIYATI: "
+              f"{decimal_text(sale_price)} TL"
+          )
+          print(
+              "MEVCUT TRENDYOL LISTE FIYATI: "
+              f"{decimal_text(list_price)} TL"
+          )
+          print(
+              "FIYAT DEGISIM ORANI: "
+              f"%{decimal_text(change_percent)}"
+          )
+          print("=" * 68)
 
           if MODE == "KONTROL":
-              print("KONTROL modu: Trendyol'a hicbir fiyat veya stok gonderilmedi.")
+              if risky_change:
+                  print(
+                      "UYARI: Fiyat farki %40 sinirini asti. "
+                      "UYGULA modunda RISKLI_FIYATI_ONAYLA gerekir."
+                  )
+              print(
+                  "KONTROL modu: Trendyol'a hicbir fiyat veya stok "
+                  "gonderilmedi."
+              )
               save_report()
               raise SystemExit(0)
 
-          if CONFIRMATION != "FIYATI_GUNCELLE":
+          required_confirmation = (
+              "RISKLI_FIYATI_ONAYLA"
+              if risky_change
+              else "FIYATI_GUNCELLE"
+          )
+
+          if CONFIRMATION != required_confirmation:
               raise SystemExit(
-                  "UYGULA icin confirmation alanina FIYATI_GUNCELLE yazilmali."
+                  "UYGULA icin confirmation alanina aynen "
+                  f"{required_confirmation} yazilmali."
               )
 
-          # Stok alani bilerek gonderilmiyor; yalnizca bu tek barkodun
-          # satis ve liste fiyati ayni hesaplanan degere cekiliyor.
           payload = {
               "items": [{
                   "barcode": BARCODE,
@@ -301,18 +405,23 @@ jobs:
                   "listPrice": float(target_price),
               }]
           }
+
           update_url = (
               f"{BASE}/integration/inventory/sellers/{SELLER_ID}"
               "/products/price-and-inventory"
           )
           submitted = request_json("POST", update_url, payload)
           batch_id = submitted.get("batchRequestId")
+
           if not batch_id:
               report["submitResponse"] = submitted
               save_report()
               raise SystemExit("Trendyol batchRequestId dondurmedi.")
 
-          report.update({"sent": True, "batchRequestId": batch_id})
+          report.update({
+              "sent": True,
+              "batchRequestId": batch_id,
+          })
           save_report()
           print(f"Trendyol kabul etti. batchRequestId={batch_id}")
 
@@ -320,46 +429,61 @@ jobs:
               f"{BASE}/integration/product/sellers/{SELLER_ID}"
               f"/products/batch-requests/{urllib.parse.quote(batch_id)}"
           )
+
           result = {}
           for attempt in range(1, 31):
               result = request_json("GET", batch_url)
               status = str(result.get("status", "")).upper()
-              print(f"Sonuc sorgusu {attempt}/30: {status or 'BEKLIYOR'}")
+              print(
+                  f"Sonuc sorgusu {attempt}/30: "
+                  f"{status or 'BEKLIYOR'}"
+              )
               if status in {"COMPLETED", "FAILED"}:
                   break
               time.sleep(5)
           else:
               report["batchResult"] = result
               save_report()
-              raise SystemExit("Batch 150 saniyede tamamlanmadi.")
+              raise SystemExit(
+                  "Batch 150 saniyede tamamlanmadi."
+              )
 
           report["batchResult"] = result
           save_report()
+
           items = result.get("items") or []
           failed_items = [
-              batch_item for batch_item in items
+              batch_item
+              for batch_item in items
               if str(batch_item.get("status", "")).upper() != "SUCCESS"
           ]
+
           if str(result.get("status", "")).upper() != "COMPLETED":
-              raise SystemExit(f"Batch basarisiz: {result.get('status')}")
+              raise SystemExit(
+                  f"Batch basarisiz: {result.get('status')}"
+              )
+
           if int(result.get("failedItemCount") or 0) or failed_items:
               reasons = [
                   batch_item.get("failureReasons")
                   for batch_item in failed_items
               ]
-              raise SystemExit(f"Fiyat guncellenemedi: {reasons}")
+              raise SystemExit(
+                  f"Fiyat guncellenemedi: {reasons}"
+              )
 
           print(
-              f"BASARILI: Trendyol {BARCODE} barkodunun fiyatini "
-              f"{target_price} TL olarak tamamladi."
+              "BASARILI: Trendyol "
+              f"{BARCODE} barkodunun fiyatini "
+              f"{decimal_text(target_price)} TL olarak tamamladi."
           )
           PY
 
-      - name: Fiyat test raporunu sakla
+      - name: Kuzgun fiyat raporunu sakla
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: trendyol-fiyat-test-${{ inputs.barcode }}
-          path: trendyol-fiyat-kontrol-raporu.json
+          name: kuzgun-fiyat-raporu-${{ inputs.barcode }}
+          path: kuzgun-fiyat-kontrol-raporu.json
           if-no-files-found: warn
           retention-days: 30
