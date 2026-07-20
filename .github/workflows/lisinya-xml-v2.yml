@@ -1,0 +1,38 @@
+name: Kuzgun XML Engine v2
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Depoyu al
+        uses: actions/checkout@v4
+
+      - name: Python kur
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Motoru çalıştır
+        run: |
+          python scripts/build_lisinya_xml.py
+
+      - name: Pages ayarla
+        uses: actions/configure-pages@v5
+
+      - name: Artifact yükle
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: public
+
+      - name: Yayınla
+        id: deployment
+        uses: actions/deploy-pages@v4
