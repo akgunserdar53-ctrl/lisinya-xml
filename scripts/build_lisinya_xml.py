@@ -4,6 +4,7 @@
 import os
 import re
 import sys
+import time
 import urllib.request
 import xml.etree.ElementTree as ET
 from pathlib import Path
@@ -205,6 +206,7 @@ def validate_xml() -> None:
 
 def main() -> int:
     try:
+        start_time = time.time()
         print("Kuzgun XML Engine v2 başlatıldı.")
         download_xml()
         counts = transform_xml()
@@ -215,6 +217,49 @@ def main() -> int:
     except Exception as exc:
         print(f"HATA: {exc}", file=sys.stderr)
         return 1
+
+
+if __name__ == "__main__":def create_report(products, counts, size, elapsed):
+
+    report = f"""
+<!doctype html>
+<html lang="tr">
+<head>
+<meta charset="utf-8">
+<title>Kuzgun XML Engine v2</title>
+<style>
+body{{font-family:Arial;background:#f5f5f5;padding:40px}}
+table{{border-collapse:collapse;background:white}}
+td{{padding:10px 20px;border:1px solid #ddd}}
+h1{{color:#ff6600}}
+</style>
+</head>
+
+<body>
+
+<h1>Kuzgun XML Engine v2</h1>
+
+<table>
+
+<tr><td>Toplam Ürün</td><td>{products}</td></tr>
+
+<tr><td>Lisinya Temizlenen</td><td>{counts["LISINYA"]}</td></tr>
+
+<tr><td>No Name Marka</td><td>{counts["MARKA_NO_NAME"]}</td></tr>
+
+<tr><td>K0707 Temizlenen</td><td>{counts["K0707"]}</td></tr>
+
+<tr><td>XML Boyutu</td><td>{size:,} byte</td></tr>
+
+<tr><td>İşlem Süresi</td><td>{elapsed:.2f} saniye</td></tr>
+
+</table>
+
+</body>
+</html>
+"""
+
+   Path("public/rapor.html").write_text(report, encoding="utf-8")
 
 
 if __name__ == "__main__":
