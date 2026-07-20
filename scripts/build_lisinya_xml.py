@@ -205,61 +205,65 @@ def validate_xml() -> None:
 
 
 def main() -> int:
+    start_time = time.time()
+
     try:
-        start_time = time.time()
         print("Kuzgun XML Engine v2 başlatıldı.")
         download_xml()
         counts = transform_xml()
         validate_xml()
+
+        elapsed = time.time() - start_time
+        create_report(counts, elapsed)
+
         print("İşlem tamamlandı.")
         print("Temizlik özeti:", counts)
+        print("Rapor oluşturuldu: public/rapor.html")
         return 0
+
     except Exception as exc:
         print(f"HATA: {exc}", file=sys.stderr)
         return 1
 
 
-if __name__ == "__main__":def create_report(products, counts, size, elapsed):
+def create_report(counts: dict[str, int], elapsed: float) -> None:
+    products = 0
 
-    report = f"""
-<!doctype html>
+    for _, element in ET.iterparse(OUTPUT_FILE, events=("end",)):
+        if local_name(element.tag) == "product":
+            products += 1
+        element.clear()
+
+    size = OUTPUT_FILE.stat().st_size
+
+    report = f"""<!doctype html>
 <html lang="tr">
 <head>
 <meta charset="utf-8">
 <title>Kuzgun XML Engine v2</title>
 <style>
-body{{font-family:Arial;background:#f5f5f5;padding:40px}}
-table{{border-collapse:collapse;background:white}}
-td{{padding:10px 20px;border:1px solid #ddd}}
-h1{{color:#ff6600}}
+body {{ font-family: Arial, sans-serif; background: #f5f5f5; padding: 40px; }}
+table {{ border-collapse: collapse; background: white; }}
+td {{ padding: 10px 20px; border: 1px solid #ddd; }}
+h1 {{ color: #ff6600; }}
 </style>
 </head>
-
 <body>
-
 <h1>Kuzgun XML Engine v2</h1>
-
 <table>
-
 <tr><td>Toplam Ürün</td><td>{products}</td></tr>
-
 <tr><td>Lisinya Temizlenen</td><td>{counts["LISINYA"]}</td></tr>
-
 <tr><td>No Name Marka</td><td>{counts["MARKA_NO_NAME"]}</td></tr>
-
 <tr><td>K0707 Temizlenen</td><td>{counts["K0707"]}</td></tr>
-
+<tr><td>Açıklama Eklenen</td><td>{counts["FOOTER_EKLENDI"]}</td></tr>
 <tr><td>XML Boyutu</td><td>{size:,} byte</td></tr>
-
 <tr><td>İşlem Süresi</td><td>{elapsed:.2f} saniye</td></tr>
-
 </table>
-
 </body>
 </html>
 """
 
-   Path("public/rapor.html").write_text(report, encoding="utf-8")
+    Path("public/rapor.html").write_text(report, encoding="utf-8")
 
 
 if __name__ == "__main__":
